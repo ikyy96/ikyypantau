@@ -1,0 +1,35 @@
+# ============================================================
+# systemd service - Lab Monitoring Backend (Node.js)
+# Lokasi di VPS: /etc/systemd/system/lab-monitoring.service
+#
+# Backend: main.js (Node.js) — satu-satunya backend project ini.
+#
+# Aktifkan:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lab-monitoring
+#   sudo systemctl status lab-monitoring
+# ============================================================
+
+[Unit]
+Description=Lab Monitoring System (Node.js)
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+# GANTI user ini sesuai user yang punya folder project (mis. ubuntu)
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ikyypantau
+
+# Environment variables (password, token, google client id)
+EnvironmentFile=/home/ubuntu/ikyypantau/.env
+
+ExecStart=/usr/bin/node /home/ubuntu/ikyypantau/main.js
+
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/ikyypantau/lab_monitoring.log
+StandardError=append:/home/ubuntu/ikyypantau/lab_monitoring.log
+
+[Install]
+WantedBy=multi-user.target

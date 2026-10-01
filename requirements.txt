@@ -1,9 +1,12 @@
-google-auth==2.28.1
-requests==2.31.0
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
+# ============================================================
+# Dependencies untuk AGENT (agent.py) yang jalan di PC client.
+#
+# Backend server TIDAK memakai Python lagi.
+# Backend sekarang: main.js (Node.js) -> install lewat `npm install`
+# (lihat package.json).
+# ============================================================
+
 paho-mqtt==1.6.1
 psutil==5.9.8
 pynvml==13.0.1
 pywin32==311
-itsdangerous==2.1.2

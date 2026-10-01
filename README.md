@@ -3,7 +3,7 @@
 Sistem monitoring real-time untuk lab komputer dengan dashboard **Cyberpunk theme**, fitur keamanan multi-layer, remote command execution, efek hacker, dukungan **Google Login** (OAuth 2.0), dan **manajemen whitelist email via API**. Bisa diakses dari **HP via ZeroTier**.
 
 ![Version](https://img.shields.io/badge/version-2.2.0-blue)
-![Python](https://img.shields.io/badge/python-3.8%2B-green)
+![Node.js](https://img.shields.io/badge/node.js-20%2B-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
 ---
@@ -81,41 +81,39 @@ Saat **Shutdown** atau **Restart** dijalankan, terminal **PC target** menampilka
 
 ```bash
 # Clone repository
-git clone https://github.com/ikyy96/web-lab-monitoring-system.git
-cd web-lab-monitoring-system
+git clone https://github.com/ikyy96/ikyypantau.git
+cd ikyypantau
 
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies backend (Node.js)
+npm install
 ```
 
 ### 2. Requirements
-- Python 3.8+
+- **Node.js 20 LTS** untuk backend `main.js`
 - Mosquitto MQTT Broker
 - Modern browser (Chrome/Edge/Firefox/Safari)
 - (Opsional) ZeroTier untuk akses HP/remote
+- **Python 3.8+** hanya untuk `agent.py` di PC client (bukan backend)
 
-### 3. Dependencies
+### 3. Dependencies Backend (`main.js`)
 | Package | Versi | Fungsi |
 |---|---|---|
-| `fastapi` | 0.109.0 | Backend web framework |
-| `uvicorn` | 0.27.0 | ASGI server |
-| `paho-mqtt` | 1.6.1 | MQTT client (v1 & v2 compatible) |
-| `psutil` | 5.9.8 | System monitoring |
-| `pynvml` | 13.0.1 | NVIDIA GPU monitoring |
-| `pywin32` | 311 | Windows WMI (AMD/Intel GPU) |
-| `google-auth` | 2.28.1 | Google OAuth verification |
-| `requests` | 2.31.0 | HTTP requests |
-| `itsdangerous` | 2.1.2 | Session signing |
+| `express` | ^4.18.2 | Backend web framework |
+| `express-session` | ^1.17.3 | Session management |
+| `ws` | ^8.16.0 | WebSocket server |
+| `mqtt` | ^5.3.0 | MQTT client |
+
+> ℹ️ `requirements.txt` hanya untuk `agent.py` di PC client (`pip install -r requirements.txt`), **bukan** untuk backend.
 
 ---
 
 ## ⚙️ Konfigurasi
 
 ### 🔐 1. Ubah Password Admin
-```python
-# Di main.py - cari baris ini:
-ADMIN_PASSWORD = os.environ.get("LAB_PASSWORD", "admin123")
-# ^^^^ UBAH "admin123" dengan password kuat!
+```javascript
+// Di main.js - cari baris ini:
+const ADMIN_PASSWORD = process.env.LAB_PASSWORD || 'admin123';
+// ^^^^ UBAH 'admin123' dengan password kuat!
 ```
 Atau via environment variable (lebih aman):
 ```bash
@@ -127,7 +125,7 @@ export LAB_PASSWORD=passwordkuatbanget123
 ```
 
 ### 🌐 2. Konfigurasi IP Broker MQTT
-**Server (main.py):** `MQTT_BROKER = "localhost"` atau IP ZeroTier  
+**Server (main.js):** `MQTT_BROKER = '127.0.0.1'` atau IP ZeroTier  
 **Agent (agent.py):** `BROKER_URL = "<IP_SERVER>"` (IP yang bisa diakses agent)
 
 ### 🔑 3. Environment Variables
@@ -185,14 +183,16 @@ set ALLOWED_EMAILS=email1@gmail.com,email2@gmail.com
 ## 📖 Cara Menjalankan
 
 ```bash
-# Development mode
-python main.py
+# Install dependency (sekali saja)
+npm install
 
-# Production (recommended)
-uvicorn main:app --host 0.0.0.0 --port 8800 --workers 4
+# Jalankan backend (Node.js)
+node main.js
+# atau
+npm start
 
 # Demo mode (tanpa MQTT, untuk testing)
-# Set USE_MQTT = False di main.py
+# Set USE_MQTT = false di main.js
 ```
 
 ### Menjalankan Agent di Client PC
@@ -234,7 +234,7 @@ INTERNET 🌐
      │
      └── ZeroTier Virtual Network 🔷  (contoh: 10.147.x.x)
           │
-          ├── [🖥️ SERVER]  main.py + Mosquitto
+          ├── [🖥️ SERVER]  main.js + Mosquitto
           │    ├── ZeroTier IP: 10.147.1.1 (static)
           │    ├── Dashboard → port 8800
           │    └── MQTT Broker → port 1883
@@ -352,18 +352,17 @@ netsh advfirewall firewall add rule name="MQTT 1883" dir=in action=allow protoco
 4. **Authorized redirect URIs**: Sama dengan origins
 5. Klik **Create** → Copy **Client ID**
 
-### Langkah 5: Update main.py
+### Langkah 5: Update main.js
 
-```python
-# Ganti dengan Client ID dari Google Cloud Console!
-GOOGLE_CLIENT_ID = "123456789-xxxxx.apps.googleusercontent.com"
+```javascript
+// Ganti dengan Client ID dari Google Cloud Console!
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '123456789-xxxxx.apps.googleusercontent.com';
 ```
 
-### Langkah 6: Install Dependencies
+### Langkah 6: Samakan Client ID
 
-```bash
-pip install google-auth requests
-```
+Samakan `GOOGLE_CLIENT_ID` di **dua tempat**: `main.js` dan `static/index.html`.
+Tidak perlu install dependency tambahan — verifikasi Google OAuth sudah ditangani `main.js` (Express), bukan Python.
 
 ### Verifikasi
 
@@ -441,10 +440,10 @@ EMAIL_REMOVED | IP: ... | Email: olduser@gmail.com
 
 | Masalah | Solusi |
 |---|---|
-| Login gagal "Password salah" | Cek `LAB_PASSWORD` di main.py atau environment variable |
+| Login gagal "Password salah" | Cek `LAB_PASSWORD` di main.js atau environment variable |
 | IP diblokir 5 menit | Tunggu atau restart server |
 | Session expired | Login ulang (session 1 jam) |
-| Google Sign-In button tidak muncul | Cek koneksi internet, atau `GOOGLE_CLIENT_ID` di main.py |
+| Google Sign-In button tidak muncul | Cek koneksi internet, atau `GOOGLE_CLIENT_ID` di main.js |
 | "Email tidak terdaftar" | Tambahkan email ke `allowed_emails.json` atau via API |
 | Google login popup error 400 | Cek **Authorized JavaScript origins** di Google Console |
 | Login gagal di HP | Pastikan URL di HP sama dengan yang didaftarkan di Google Console |
@@ -454,16 +453,18 @@ EMAIL_REMOVED | IP: ... | Email: olduser@gmail.com
 | Circuit breaker OPEN | Tunggu 60 detik untuk recovery atau restart server |
 | Domain tidak resolve (ZeroTier) | Restart ZeroTier, cek DNS config di Console |
 | HP Android tidak bisa akses | Install ZeroTier dari Play Store, join network, authorize |
-| Agent token tidak valid | Pastikan `AGENT_TOKEN` di main.py dan agent.py sama |
+| Agent token tidak valid | Token agent bersifat opsional; samakan `LAB_AGENT_TOKEN` di `.env`/main.js bila dipakai |
 
 ---
 
 ## 📁 Struktur File
 
 ```
-├── main.py              # Backend FastAPI + MQTT + WebSocket + Auth
-├── agent.py             # Agent client PC + 💀 Efek hacker
-├── requirements.txt     # Python dependencies
+├── main.js              # Backend Node.js + MQTT + WebSocket + Auth (SATU-SATUNYA backend)
+├── package.json         # Node.js dependencies
+├── agent.py             # Agent client PC (Python) + 💀 Efek hacker
+├── requirements.txt     # Python dependencies (untuk agent.py saja)
+├── deploy/              # Konfigurasi deploy VPS (mosquitto, nginx, systemd, .env)
 ├── static/
 │   ├── index.html       # Frontend dashboard (responsive + Google Login)
 │   └── favicon.png      # Icon dashboard
@@ -479,6 +480,7 @@ EMAIL_REMOVED | IP: ... | Email: olduser@gmail.com
 ## 📝 Changelog
 
 ### v2.2.0 (Current)
+- 🟢 **Backend Node.js (`main.js`)** — satu-satunya backend project. Versi Python (`main.py`) dihapus total agar tidak ada dua backend.
 - 📧 **Email Whitelist Management API** - CRUD whitelist email via REST API
 - 💾 **Persistent Email Storage** - `allowed_emails.json` untuk persistensi
 - 🔄 **Email Reload** - Reload email whitelist tanpa restart server
