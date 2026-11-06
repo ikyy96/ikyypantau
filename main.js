@@ -33,7 +33,7 @@ const FAILED_LOGIN_LIMIT = 5;
 const FAILED_LOGIN_BLOCK = 300;
 
 // MQTT Configuration
-const MQTT_BROKER = '10.190.143.25';
+const MQTT_BROKER = process.env.MQTT_BROKER || '127.0.0.1';
 const MQTT_PORT = 1883;
 const MQTT_TOPIC = 'lab/monitoring/+';
 const MQTT_COMMAND_RESULT_TOPIC = 'lab/command/result/+';
