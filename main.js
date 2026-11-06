@@ -16,7 +16,14 @@ const session = require('express-session');
 // ==================== CONFIGURATION ====================
 const ADMIN_PASSWORD = process.env.LAB_PASSWORD || 'admin123';
 const SECRET_KEY = process.env.LAB_SECRET_KEY || crypto.randomBytes(32).toString('hex');
-const AGENT_TOKEN = process.env.LAB_AGENT_TOKEN || 'lab-token-2024';
+const AGENT_TOKEN = process.env.LAB_AGENT_TOKEN || '';
+if (!AGENT_TOKEN) {
+    console.error('LAB_AGENT_TOKEN belum di-set di .env. Backend tidak bisa menandatangani perintah. Berhenti.');
+    process.exit(1);
+}
+const MQTT_USER = process.env.LAB_MQTT_USER || '';
+const MQTT_PASS = process.env.LAB_MQTT_PASS || '';
+const PROCESS_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SESSION_MAX_AGE = 3600;      // 1 hour
 const SESSION_REFRESH_AGE = 600;   // 10 minutes
 const RATE_LIMIT_WINDOW = 60;
@@ -135,6 +142,21 @@ let ALLOWED_EMAILS_LIST = loadAllowedEmails();
 logger.info(`📧 [EMAIL WHITELIST] ${ALLOWED_EMAILS_LIST.length} email(s) terdaftar: ${ALLOWED_EMAILS_LIST.join(', ')}`);
 
 // ==================== SECURITY UTILITIES ====================
+// Tanda tangan perintah ke agent (HMAC-SHA256). Format pesan harus sama persis dengan agent.py:
+// request_id|command|timestamp|canonical(params)
+function canonical(v) {
+    if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+    if (v && typeof v === 'object') {
+        return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+    }
+    return JSON.stringify(v);
+}
+
+function signCommand(requestId, command, timestamp, params) {
+    const msg = `${requestId}|${command}|${timestamp}|${canonical(params || {})}`;
+    return crypto.createHmac('sha256', AGENT_TOKEN).update(msg).digest('hex');
+}
+
 class RateLimiter {
     constructor(window = 60, maxRequests = 30) {
         this.window = window;
@@ -773,6 +795,9 @@ app.post('/api/command', checkAuth, (req, res) => {
                 if (param === 'process_name' && !processName) {
                     return res.status(400).json({ error: `Parameter 'process_name' diperlukan untuk command '${command}'` });
                 }
+                if (param === 'process_name' && !PROCESS_NAME_RE.test(String(processName))) {
+                    return res.status(400).json({ error: "process_name tidak valid (huruf/angka . _ - , maks 64 karakter)" });
+                }
             }
         }
         if (!clients[hostname] || clients[hostname].status !== 'online') {
@@ -786,9 +811,13 @@ app.post('/api/command', checkAuth, (req, res) => {
                 if (param === 'process_name') params.process_name = processName;
             }
         }
-        const payload = { command, request_id: requestId, timestamp: new Date().toISOString(), params };
+        const timestamp = new Date().toISOString();
+        const payload = {
+            command, request_id: requestId, timestamp, params,
+            signature: signCommand(requestId, command, timestamp, params),
+        };
         const topic = `lab/command/${hostname}`;
-        mqttClient.publish(topic, JSON.stringify(payload));
+        mqttClient.publish(topic, JSON.stringify(payload), { qos: 1 });
 
         logger.info(`[AUDIT] Command: ${command} ke ${hostname} dari ${clientIp}`);
 
@@ -916,6 +945,8 @@ function setupMqtt() {
 
     mqttClient = mqtt.connect(`mqtt://${MQTT_BROKER}:${MQTT_PORT}`, {
         clientId: MQTT_CLIENT_ID,
+        username: MQTT_USER,
+        password: MQTT_PASS,
         protocolVersion: 4, // MQTT 3.1.1
         connectTimeout: 10000,
         reconnectPeriod: mqttReconnectDelay * 1000,

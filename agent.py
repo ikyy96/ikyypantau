@@ -1,868 +1,743 @@
-import psutil
-import time
-import socket
-import json
-import platform
+#!/usr/bin/env python3
+"""
+Lab Monitoring Agent - lintas OS (Windows / Linux / macOS).
+
+Satu file yang sama dipakai sebagai agent.py maupun dibungkus jadi agent.exe
+(PyInstaller). Konfigurasi dibaca dari environment variable atau dari file
+agent.env di folder yang sama dengan agent.
+
+Topik MQTT (tidak berubah dari versi lama):
+  publish  : lab/monitoring/<HOSTNAME>
+  subscribe: lab/command/<HOSTNAME>
+  hasil    : lab/command/result/<HOSTNAME>
+
+Setiap perintah dari backend WAJIB membawa signature HMAC-SHA256 atas
+  "request_id|command|timestamp|params"
+dengan params = JSON kanonik (key terurut, tanpa spasi).
+"""
 import getpass
-import subprocess
+import hashlib
+import hmac
+import json
+import locale
+import math
 import os
+import platform
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+
+# ============================================================
+# Env file + logging (harus sebelum konfigurasi)
+# ============================================================
+def _base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_env_file():
+    path = os.environ.get("LAB_ENV_FILE") or os.path.join(_base_dir(), "agent.env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+
+
+_load_env_file()
+
+# Mode --noconsole / service: stdout bisa None
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+LOG_FILE = os.environ.get("LAB_LOG_FILE", "")
+
+
+def log(msg):
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    if LOG_FILE:
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+try:
+    import psutil
+except ImportError:
+    log("psutil belum terpasang. Jalankan: pip install -r requirements.txt")
+    sys.exit(1)
+
 import paho.mqtt.client as mqtt
-from datetime import datetime
 
-# GPU Monitoring imports
-try:
-    import pynvml
-    PYNVML_AVAILABLE = True
-except:
-    PYNVML_AVAILABLE = False
 
-try:
-    import win32com.client
-    WIN32_AVAILABLE = True
-except:
-    WIN32_AVAILABLE = False
+# ============================================================
+# Konfigurasi (tanpa rahasia hardcoded)
+# ============================================================
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
-# --- KONFIGURASI ---
-# --- KONFIGURASI BARU (MENGGUNAKAN CLOUDFLARE WEBSOCKET) ---
+
+BROKER_URL = os.environ.get("LAB_BROKER_URL", "ws-mqtt.ikyypantau.my.id")
+PORT = _env_int("LAB_BROKER_PORT", 443)
+USE_TLS = os.environ.get("LAB_BROKER_TLS", "1") != "0"
+WS_PATH = os.environ.get("LAB_BROKER_PATH", "/mqtt")
+AGENT_TOKEN = os.environ.get("LAB_AGENT_TOKEN", "")
+MQTT_USER = os.environ.get("LAB_MQTT_USER", "")
+MQTT_PASS = os.environ.get("LAB_MQTT_PASS", "")
+PING_TARGET = os.environ.get("LAB_PING_TARGET", "8.8.8.8")
+PING_TIMEOUT = _env_int("LAB_PING_TIMEOUT", 2)
+COMMAND_TIMEOUT = _env_int("LAB_COMMAND_TIMEOUT", 15)
+SHUTDOWN_DELAY = _env_int("LAB_SHUTDOWN_DELAY", 30)
+TS_TOLERANCE = _env_int("LAB_TS_TOLERANCE", 60)
+INTERVAL = _env_int("LAB_INTERVAL", 2)
+SEND_FILES = os.environ.get("LAB_SEND_FILES", "0") == "1"
+
+if not AGENT_TOKEN:
+    log("LAB_AGENT_TOKEN kosong. Isi di agent.env atau environment, lalu jalankan ulang.")
+    sys.exit(1)
+
+OS_NAME = platform.system()
+IS_WINDOWS = OS_NAME == "Windows"
+IS_MACOS = OS_NAME == "Darwin"
+IS_LINUX = OS_NAME == "Linux"
+IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
 HOSTNAME = socket.gethostname()
 TOPIC = f"lab/monitoring/{HOSTNAME}"
-# Menggunakan subdomain khusus WebSocket yang diarahkan oleh Cloudflare
-BROKER_URL = "ws-mqtt.ikyypantau.my.id" 
-PORT = 443                            # Wajib port 443 untuk traffic HTTPS/WSS Cloudflare
-PING_TARGET = "8.8.8.8"
-
-CPU_THREADS = psutil.cpu_count(logical=True)
-CPU_CORES = psutil.cpu_count(logical=False)
+COMMAND_TOPIC = f"lab/command/{HOSTNAME}"
+RESULT_TOPIC = f"lab/command/result/{HOSTNAME}"
 
 
+# ============================================================
+# Helper subprocess
+# ============================================================
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0
+
+
+def run(args, timeout):
+    """Jalankan perintah TANPA shell. stdin ditutup supaya aman di --noconsole."""
+    return subprocess.run(
+        args,
+        capture_output=True,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+        creationflags=NO_WINDOW,
+    )
+
+
+def decode(data):
+    if not data:
+        return ""
+    for enc in ("utf-8", locale.getpreferredencoding(False), "cp1252"):
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+# ============================================================
+# Info statis (dideteksi sekali saat start)
+# ============================================================
 def get_cpu_name():
-    """Get detailed CPU name with multiple fallback methods"""
-    sys = platform.system()
-
-    if sys == "Windows":
-        # Method 1: PowerShell (most reliable on Win 10/11)
-        try:
-            result = subprocess.run([
-                'powershell', '-Command',
-                '(Get-CimInstance Win32_Processor).Name'
-            ], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except:
-            pass
-
-        # Method 2: wmic (legacy fallback)
-        try:
-            result = subprocess.run(['wmic', 'cpu', 'get', 'name'],
-                                  capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-                for line in lines:
-                    if line.lower() != 'name' and line:
-                        return line
-        except:
-            pass
-
-        # Method 3: Registry fallback
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                               r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-            name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
-            winreg.CloseKey(key)
-            if name:
-                return name.strip()
-        except:
-            pass
-
-    elif sys == "Linux":
-        try:
-            with open('/proc/cpuinfo', 'r') as f:
-                for line in f:
-                    if line.startswith('model name'):
-                        return line.split(':')[1].strip()
-        except:
-            pass
-        try:
-            result = subprocess.run(['lscpu'], capture_output=True, text=True, timeout=5)
-            for line in result.stdout.split('\n'):
-                if 'Model name' in line:
-                    return line.split(':')[1].strip()
-        except:
-            pass
-
-    elif sys == "Darwin":
-        try:
-            result = subprocess.run(['sysctl', '-n', 'machdep.cpu.brand_string'],
-                                  capture_output=True, text=True, timeout=5)
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-        except:
-            pass
-
+    try:
+        if IS_WINDOWS:
+            r = run(["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance Win32_Processor).Name"], 8)
+            out = decode(r.stdout).strip()
+            if r.returncode == 0 and out:
+                return out.splitlines()[0].strip()
+            try:
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+                name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+                winreg.CloseKey(key)
+                if name:
+                    return name.strip()
+            except Exception:
+                pass
+        elif IS_LINUX:
+            try:
+                with open("/proc/cpuinfo", errors="replace") as f:
+                    for line in f:
+                        if line.startswith("model name"):
+                            return line.split(":", 1)[1].strip()
+            except OSError:
+                pass
+            r = run(["lscpu"], 5)
+            for line in decode(r.stdout).splitlines():
+                if "Model name" in line:
+                    return line.split(":", 1)[1].strip()
+        elif IS_MACOS:
+            r = run(["sysctl", "-n", "machdep.cpu.brand_string"], 5)
+            out = decode(r.stdout).strip()
+            if r.returncode == 0 and out:
+                return out
+    except Exception:
+        pass
     return platform.processor() or "Unknown CPU"
 
 
 CPU_NAME = get_cpu_name()
-print(f"[✓] CPU Terdeteksi: {CPU_NAME}")
+CPU_THREADS = psutil.cpu_count(logical=True)
+CPU_CORES = psutil.cpu_count(logical=False)
 
+# GPU: NVIDIA via pynvml (opsional), init sekali
+GPU_OK = False
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    GPU_OK = True
+except Exception:
+    GPU_OK = False
 
-def init_gpu_monitoring():
-    if PYNVML_AVAILABLE:
-        try:
-            pynvml.nvmlInit()
-            return True
-        except:
-            return False
-    return False
-
-
-GPU_INITIALIZED = init_gpu_monitoring()
+GPU_FALLBACK = []
+if IS_WINDOWS and not GPU_OK:
+    try:
+        r = run(["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_VideoController).Name"], 8)
+        for name in decode(r.stdout).splitlines():
+            name = name.strip()
+            if name:
+                GPU_FALLBACK.append({
+                    "name": name, "type": "Unknown", "temperature": 0,
+                    "utilization": 0, "memory_util": 0,
+                    "memory_used_gb": 0, "memory_total_gb": 0})
+    except Exception:
+        pass
 
 
 def get_gpu_info():
-    """Get GPU information for all GPUs (NVIDIA, AMD, Intel)"""
+    """Daftar GPU. Kosong ([]) bila tidak ada; tidak pernah melempar error."""
+    if not GPU_OK:
+        return GPU_FALLBACK
     gpus = []
-
-    # NVIDIA via pynvml
-    if GPU_INITIALIZED:
-        try:
-            device_count = pynvml.nvmlDeviceGetCount()
-            for i in range(device_count):
-                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                name = pynvml.nvmlDeviceGetName(handle)
-                if isinstance(name, bytes):
-                    name = name.decode('utf-8')
-
-                memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                memory_used_gb = round(memory_info.used / (1024**3), 2)
-                memory_total_gb = round(memory_info.total / (1024**3), 2)
-
-                try:
-                    temperature = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-                except:
-                    temperature = 0
-
-                try:
-                    utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                    gpu_util = utilization.gpu
-                    memory_util = utilization.memory
-                except:
-                    gpu_util = 0
-                    memory_util = 0
-
-                gpus.append({
-                    "name": name, "type": "NVIDIA", "temperature": temperature,
-                    "utilization": gpu_util, "memory_util": memory_util,
-                    "memory_used_gb": memory_used_gb, "memory_total_gb": memory_total_gb
-                })
-        except Exception as e:
-            print(f"Error getting NVIDIA GPU info: {e}")
-
-    # AMD/Intel via WMI (Windows only)
-    if WIN32_AVAILABLE and platform.system() == "Windows":
-        try:
-            wmi = win32com.client.GetObject("winmgmts:")
-            gpu_list = wmi.InstancesOf("Win32_VideoController")
-            for gpu in gpu_list:
-                gpu_name = gpu.Name
-                if "NVIDIA" in gpu_name and gpus:
-                    continue
-                adapter_ram = gpu.AdapterRAM
-                memory_total_gb = round(adapter_ram / (1024**3), 1) if adapter_ram else 0
-                gpus.append({
-                    "name": gpu_name,
-                    "type": "AMD/Intel" if "AMD" in gpu_name or "Intel" in gpu_name else "Unknown",
-                    "temperature": 0, "utilization": 0, "memory_util": 0,
-                    "memory_used_gb": 0, "memory_total_gb": memory_total_gb,
-                    "driver_version": gpu.DriverVersion or "N/A"
-                })
-        except Exception as e:
-            print(f"Error getting AMD/Intel GPU info: {e}")
-
-    # Fallback: wmic
-    if not gpus:
-        try:
-            result = subprocess.run(['wmic', 'path', 'win32_VideoController', 'get', 'name'],
-                                  capture_output=True, text=True)
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')[1:]
-                for line in lines:
-                    name = line.strip()
-                    if name:
-                        gpus.append({
-                            "name": name, "type": "Unknown",
-                            "temperature": 0, "utilization": 0, "memory_util": 0,
-                            "memory_used_gb": 0, "memory_total_gb": 0
-                        })
-        except:
-            pass
-
+    try:
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(h)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+            try:
+                temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+            except Exception:
+                temp = 0
+            try:
+                util = pynvml.nvmlDeviceGetUtilizationRates(h)
+                gpu_util, mem_util = util.gpu, util.memory
+            except Exception:
+                gpu_util, mem_util = 0, 0
+            gpus.append({
+                "name": name, "type": "NVIDIA", "temperature": temp,
+                "utilization": gpu_util, "memory_util": mem_util,
+                "memory_used_gb": round(mem.used / (1024 ** 3), 2),
+                "memory_total_gb": round(mem.total / (1024 ** 3), 2)})
+    except Exception:
+        return GPU_FALLBACK
     return gpus
 
 
-def get_active_interface_via_ping():
-    print("[*] Mencari interface aktif dengan akses internet...")
-    is_windows = platform.system() == "Windows"
-    addrs = psutil.net_if_addrs()
-
-    for intf, addr_list in addrs.items():
-        if intf.lower() in ['lo', 'loopback', 'localhost']:
-            continue
-        for addr in addr_list:
-            if addr.family == socket.AF_INET:
-                ip_address = addr.address
-                try:
-                    if is_windows:
-                        cmd = ["ping", "-n", "1", "-w", "500", "-S", ip_address, PING_TARGET]
-                    else:
-                        cmd = ["ping", "-c", "1", "-W", "1", "-I", intf, PING_TARGET]
-                    startupinfo = None
-                    if is_windows:
-                        startupinfo = subprocess.STARTUPINFO()
-                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    subprocess.check_output(cmd, startupinfo=startupinfo, stderr=subprocess.STDOUT)
-                    print(f"    [+] Terpilih: {intf} ({ip_address})")
-                    return intf
-                except:
-                    continue
-    return list(addrs.keys())[0] if addrs else "eth0"
-
-
-INTERFACE_NAME = get_active_interface_via_ping()
-
-
-def get_interface_ip_mac(interface_name):
-    addrs = psutil.net_if_addrs()
-    ip_address = None
-    mac_address = None
-    if interface_name in addrs:
-        for addr in addrs[interface_name]:
-            if addr.family == socket.AF_INET and not ip_address:
-                ip_address = addr.address
-            if addr.family == psutil.AF_LINK and not mac_address:
-                mac_address = addr.address
-    return ip_address or "N/A", mac_address or "N/A"
-
-
-def get_top_processes(limit=5):
-    processes = []
+def detect_interface():
+    """Interface yang dipakai keluar ke internet. Return (nama, ip, mac)."""
+    local_ip = None
     try:
-        for proc in psutil.process_iter(['name', 'cpu_percent', 'memory_percent']):
-            try:
-                pinfo = proc.info
-                if pinfo['name'] and pinfo['cpu_percent']:
-                    processes.append((pinfo['name'], round(pinfo['cpu_percent'], 1),
-                                    round(pinfo['memory_percent'] or 0, 1)))
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        processes.sort(key=lambda x: x[1], reverse=True)
-    except:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2)
+        s.connect(("8.8.8.8", 80))  # UDP, tidak mengirim paket
+        local_ip = s.getsockname()[0]
+        s.close()
+    except OSError:
         pass
-    return [{"name": p[0], "cpu": p[1], "mem": p[2]} for p in processes[:limit]]
-
-
-def get_largest_files(limit=5):
-    files = []
-    is_windows = platform.system() == "Windows"
-    if is_windows:
-        search_paths = [
-            os.path.join(os.environ.get('USERPROFILE', 'C:\\Users\\Public'), 'Desktop'),
-            os.path.join(os.environ.get('USERPROFILE', 'C:\\Users\\Public'), 'Documents'),
-            os.path.join(os.environ.get('USERPROFILE', 'C:\\Users\\Public'), 'Downloads')
-        ]
-    else:
-        search_paths = [
-            os.path.expanduser('~/Desktop'),
-            os.path.expanduser('~/Documents'),
-            os.path.expanduser('~/Downloads')
-        ]
     try:
-        for path in search_paths:
-            if os.path.exists(path):
-                for root, dirs, filenames in os.walk(path, topdown=True):
-                    dirs[:] = [d for d in dirs if not d.startswith('.') and not d.startswith('$')]
-                    if len(files) >= limit * 3:
-                        break
-                    for f in filenames[:100]:
-                        try:
-                            fpath = os.path.join(root, f)
-                            if os.path.isfile(fpath) and not os.path.islink(fpath):
-                                size = os.path.getsize(fpath)
-                                if size > 1024 * 1024:
-                                    files.append((fpath, size))
-                        except:
-                            continue
-                    if len(files) >= limit * 3:
-                        break
-        files.sort(key=lambda x: x[1], reverse=True)
-    except:
-        pass
-    return [{"name": os.path.basename(f[0]), "path": f[0],
-             "size_mb": round(f[1] / (1024 * 1024), 1)} for f in files[:limit]]
+        addrs = psutil.net_if_addrs()
+    except Exception:
+        return "eth0", "N/A", "N/A"
+    found = None
+    for name, lst in addrs.items():
+        for a in lst:
+            if a.family == socket.AF_INET:
+                if local_ip and a.address == local_ip:
+                    found = name
+                elif found is None and not a.address.startswith(("127.", "169.254.")) \
+                        and name.lower() not in ("lo", "loopback", "localhost"):
+                    found = found or name
+        if found and local_ip and any(
+                a.family == socket.AF_INET and a.address == local_ip for a in lst):
+            break
+    if not found:
+        return (next(iter(addrs), "eth0"), "N/A", "N/A")
+    ip, mac = "N/A", "N/A"
+    for a in addrs[found]:
+        if a.family == socket.AF_INET and ip == "N/A":
+            ip = a.address
+        if a.family == psutil.AF_LINK and mac == "N/A":
+            mac = a.address or "N/A"
+    return found, ip, mac
 
 
+INTERFACE_NAME, IP_ADDRESS, MAC_ADDRESS = detect_interface()
+
+
+# ============================================================
+# Metrik dinamis
+# ============================================================
 def get_uptime():
     try:
-        uptime_seconds = time.time() - psutil.boot_time()
-        return f"{int(uptime_seconds // 3600)}h {int((uptime_seconds % 3600) // 60)}m"
-    except:
+        secs = time.time() - psutil.boot_time()
+        return f"{int(secs // 3600)}h {int((secs % 3600) // 60)}m"
+    except Exception:
         return "N/A"
 
 
 def get_latency(host):
-    try:
-        is_windows = platform.system() == "Windows"
-        cmd = ["ping", "-n" if is_windows else "-c", "1", "-w" if is_windows else "-W", "1", host]
-        startupinfo = None
-        if is_windows:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        output = subprocess.check_output(cmd, startupinfo=startupinfo,
-                                         stderr=subprocess.STDOUT, universal_newlines=True)
-        if "time=" in output:
-            val = output.split("time=")[1].split("ms")[0].strip()
-            return int(float(val))
-    except:
+    """Ping satu kali. Flag timeout berbeda per OS. 999 bila gagal."""
+    if not host:
         return 999
-    return 0
-
-
-def get_net_usage(interface):
+    if IS_WINDOWS:
+        cmd = ["ping", "-n", "1", "-w", str(PING_TIMEOUT * 1000), host]
+    elif IS_MACOS:
+        cmd = ["ping", "-c", "1", "-t", str(PING_TIMEOUT), host]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(PING_TIMEOUT), host]
     try:
-        net_io = psutil.net_io_counters(pernic=True)
-        if interface in net_io:
-            return net_io[interface].bytes_recv, net_io[interface].bytes_sent
-    except:
+        r = run(cmd, PING_TIMEOUT + 4)
+        if r.returncode != 0:
+            return 999
+        m = re.search(r"[=<]\s*([\d.]+)\s*ms", decode(r.stdout), re.IGNORECASE)
+        return int(float(m.group(1))) if m else 999
+    except Exception:
+        return 999
+
+
+def get_net_usage():
+    try:
+        n = psutil.net_io_counters(pernic=True)
+        if INTERFACE_NAME in n:
+            return n[INTERFACE_NAME].bytes_recv, n[INTERFACE_NAME].bytes_sent
+    except Exception:
         pass
     return 0, 0
 
 
-# ==================== REMOTE COMMAND EXECUTION ====================
-COMMAND_TIMEOUT = 15
-ALLOWED_COMMANDS = {
-    'tasklist': 'tasklist' if platform.system() == 'Windows' else 'ps aux',
-    'ipconfig': 'ipconfig' if platform.system() == 'Windows' else 'ifconfig',
-    'whoami': 'whoami',
-    'systeminfo': 'systeminfo' if platform.system() == 'Windows' else 'uname -a',
-    'taskkill': None,
-    'shutdown': None,
-    'restart': None,
-    'cancel_shutdown': None,
-}
+SKIP_FSTYPES = {"squashfs", "tmpfs", "devtmpfs", "overlay", "iso9660", "autofs", "proc", "sysfs"}
 
 
-def show_hacker_effect(command_name):
-    """Tampilkan efek hacker dramatis di terminal target PC"""
-    import sys
-    is_windows = platform.system() == "Windows"
-    
-    SKULL = """
-    ████████████████████████████████████████████████████████████████
-    █                                                             █
-    █   ░▒▓█▓▒░░▒▓████▓▒░     ░▒▓█▓▒░      ░▒▓██████▓▒░          █
-    █   ░▒▓█▓▒░ ░▒▓█▓▒░       ░▒▓█▓▒░     ░▒▓█▓▒░                █
-    █   ░▒▓█▓▒░  ░▒▓█▓▒░      ░▒▓█▓▒░     ░▒▓█▓▒░                █
-    █   ░▒▓█▓▒░   ░▒▓█▓▒░     ░▒▓█▓▒░     ░▒▓█▓▒░   ░▒▓██████▓▒░  █
-    █   ░▒▓█▓▒░   ░▒▓█▓▒░     ░▒▓█▓▒░     ░▒▓█▓▒░  ░▒▓█▓▒░       █
-    █   ░▒▓█▓▒░  ░▒▓█▓▒░      ░▒▓█▓▒░     ░▒▓█▓▒░  ░▒▓█▓▒░       █
-    █   ░▒▓█▓▒░ ░▒▓█▓▒░       ░▒▓█▓▒░     ░▒▓█▓▒░  ░▒▓█▓▒░       █
-    █   ░▒▓█▓▒░ ░▒▓████▓▒░    ░▒▓█▓▒░      ░▒▓██████▓▒░           █
-    █                                                             █
-    ████████████████████████████████████████████████████████████████
-    """
-    
-    HACKER_LINES = [
-        "[⛔] INCOMING REMOTE COMMAND - UNAUTHORIZED ACCESS DETECTED!",
-        "[⚠️] Sistem telah diakses oleh pihak ketiga!",
-        "[🔓] Remote connection established from 192.168.2.2:8800",
-        "[💀] Menerima perintah berbahaya: " + command_name.upper(),
-        "",
-        "[🛡️] Mencoba memblokir... GAGAL! Sistem keamanan telah ditembus!",
-        "[⚡] Mengambil alih kendali sistem... BERHASIL!",
-        "",
-        "     ════════════════════════════════════════════════════",
-        f"     ⚠️⚠️⚠️  PERINGATAN: PC ANDA AKAN {command_name.upper()}  ⚠️⚠️⚠️",
-        "     ════════════════════════════════════════════════════",
-        "",
-        "     Anda memiliki 30 detik untuk menyimpan pekerjaan!",
-        "     Segera tutup semua aplikasi!",
-        "",
-    ]
-    
-    # Clear screen
-    os.system('cls' if is_windows else 'clear')
-    
-    # Print skull
-    for line in SKULL.split('\n'):
-        print(f"\033[91m{line}\033[0m")  # Red color
-        time.sleep(0.03)
-    
-    time.sleep(0.5)
-    
-    # Print hacker lines with typing effect
-    for line in HACKER_LINES:
-        if line.startswith("     ═") or line.startswith("     ⚠"):
-            print(f"\033[93m{line}\033[0m")  # Yellow for warning box
-        elif "GAGAL" in line or "BERHASIL" in line or "ditembus" in line:
-            print(f"\033[91m{line}\033[0m")  # Red for danger
-        elif "PERINGATAN" in line:
-            print(f"\033[93m{line}\033[0m")  # Yellow
-        elif "30 detik" in line or "tutup" in line:
-            print(f"\033[92m{line}\033[0m")  # Green for instructions
-        else:
-            print(f"\033[96m{line}\033[0m")  # Cyan for info
-        time.sleep(0.15)
-    
-    time.sleep(1)
-    
-    # ==================== MATRIX RAIN - FULL SCREEN DIGITAL RAIN ====================
-    import random
-    import shutil
-    import sys
-    
-    ts = shutil.get_terminal_size()
-    COLS = ts.columns
-    ROWS = ts.lines
-    
-    chars = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-    
-    # Hide cursor
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
-    
-    # Initialize columns with random properties
-    columns = []
-    for i in range(COLS):
-        columns.append({
-            'y': random.randint(-ROWS, 0),      # Start position (off screen)
-            'speed': random.randint(1, 4),        # Fall speed
-            'length': random.randint(5, 25),      # Trail length
-            'chars': [random.choice(chars) for _ in range(ROWS + 10)]  # Pre-generated chars for speed
-        })
-    
-    # Fill entire screen with dark green background first
-    sys.stdout.write("\033[40m")  # Black background
-    
+def get_disk_info():
+    total = used = free = 0
+    drives = []
     try:
-        for frame in range(80):  # 80 frames = ~6 detik animasi
-            # Draw each column
-            for col in columns:
-                i = columns.index(col)
-                y = int(col['y'])
-                speed = col['speed']
-                trail_len = col['length']
-                
-                # Update trail characters (shift down)
-                if frame % speed == 0:
-                    # Dim all existing characters in trail (fade effect)
-                    for t in range(1, trail_len + 1):
-                        py = y - t
-                        if 0 < py <= ROWS:
-                            fade = max(0.1, 1.0 - (t / trail_len))
-                            if fade > 0.7:
-                                sys.stdout.write(f"\033[{py};{i+1}H\033[92m{col['chars'][py % len(col['chars'])]}\033[0m")
-                            elif fade > 0.4:
-                                sys.stdout.write(f"\033[{py};{i+1}H\033[2m\033[92m{col['chars'][py % len(col['chars'])]}\033[22m\033[0m")
-                            else:
-                                sys.stdout.write(f"\033[{py};{i+1}H\033[2m\033[32m{col['chars'][py % len(col['chars'])]}\033[22m\033[0m")
-                    
-                    # Bright leading character (white/yellow)
-                    if 0 < y <= ROWS:
-                        brightness = random.choice([97, 93, 92])  # White, Yellow, Green
-                        sys.stdout.write(f"\033[{y};{i+1}H\033[{brightness}m{col['chars'][y % len(col['chars'])]}\033[0m")
-                    
-                    # Clear character below trail
-                    bottom = y - trail_len - 1
-                    if 0 < bottom <= ROWS:
-                        sys.stdout.write(f"\033[{bottom};{i+1}H ")
-                    
-                    # Move position
-                    col['y'] += 0.5
-                    
-                    # Reset when off screen
-                    if y > ROWS + trail_len:
-                        col['y'] = random.randint(-ROWS, -5)
-                        col['speed'] = random.randint(1, 3)
-                        col['length'] = random.randint(10, 30)
-                        col['chars'] = [random.choice(chars) for _ in range(ROWS + 10)]
-            
-            sys.stdout.flush()
-            time.sleep(0.07)
-    
-    finally:
-        # Show cursor back
-        sys.stdout.write("\033[?25h")
-        sys.stdout.write("\033[0m")
-        sys.stdout.flush()
-    
-    # Clear matrix rain
-    os.system('cls' if is_windows else 'clear')
-    print("\033[0m", end='')
-    
-    time.sleep(0.3)
-    
-    # Hacker access granted animation
-    print("\033[92m" + "=" * 60)
-    access_lines = [
-        "[✓] ACCESS GRANTED - Remote connection established",
-        "[✓] Target locked: " + HOSTNAME,
-        "[⚡] Executing remote command: " + command_name.upper(),
-        "[✓] Command transmitted successfully",
-    ]
-    for line in access_lines:
-        print(f"\033[96m  {line}\033[0m")
-        time.sleep(0.2)
-    
-    print("\033[92m" + "=" * 60 + "\033[0m")
-    time.sleep(0.5)
-    
-    # Countdown effect with progress bar
-    print("\n\033[91m" + "█" * 60)
-    print("  ⏳ SYSTEM " + command_name.upper() + " IN PROGRESS")
-    print("  ⚠️  SIMPAN PEKERJAAN ANDA SEGERA!")
-    print("█" * 60 + "\033[0m")
-    
-    for i in range(30, 0, -3):
-        bar_len = int((30 - i) / 30 * 50)
-        bar = "█" * bar_len + "░" * (50 - bar_len)
-        print(f"\033[93m  [{bar}] {i:2d} detik tersisa\033[0m")
-        time.sleep(0.5)
-    
-    print("\033[91m" + "█" * 60 + "\033[0m")
-    print("\033[91m  💀 SYSTEM " + command_name.upper() + " TRIGGERED!\033[0m")
-    print()
-    
-    # Show Windows popup message
-    if is_windows:
+        parts = psutil.disk_partitions()
+    except Exception:
+        parts = []
+    for p in parts:
+        if "cdrom" in p.opts or p.fstype == "" or p.fstype in SKIP_FSTYPES:
+            continue
         try:
-            msg = f"🔴 REMOTE HACK DETECTED! 🔴%0APC Anda akan {command_name.upper()} dalam 30 detik!%0A%0A⚠️ Sistem telah diakses oleh pihak ketiga!%0A⚠️ Simpan pekerjaan Anda segera!%0A%0A📍 IP: 192.168.2.2:8800%0A🖥️ Target: {HOSTNAME}"
-            subprocess.Popen(['msg', '*', msg], startupinfo=subprocess.STARTUPINFO())
-        except:
+            u = psutil.disk_usage(p.mountpoint)
+        except Exception:
+            continue
+        total += u.total
+        used += u.used
+        free += u.free
+        drives.append({
+            "mount": p.mountpoint, "device": p.device, "fstype": p.fstype,
+            "total_gb": round(u.total / (1024 ** 3), 1),
+            "used_gb": round(u.used / (1024 ** 3), 1),
+            "free_gb": round(u.free / (1024 ** 3), 1),
+            "percent": round(u.percent, 1)})
+    pct = round(used / total * 100, 1) if total > 0 else 0
+    return {
+        "total_gb": round(total / (1024 ** 3), 1),
+        "used_gb": round(used / (1024 ** 3), 1),
+        "free_gb": round(free / (1024 ** 3), 1),
+        "percent": pct, "drives": drives}
+
+
+def prime_processes():
+    """Panggilan pertama cpu_percent selalu 0; panaskan sekali saat start."""
+    for p in psutil.process_iter():
+        try:
+            p.cpu_percent(None)
+        except Exception:
             pass
 
 
-def execute_command(command_name, params=None):
-    """Execute a command with timeout."""
-    start_time = time.time()
+def get_top_processes(limit=5):
+    out = []
+    try:
+        for p in psutil.process_iter(["name", "cpu_percent", "memory_percent"]):
+            i = p.info
+            name = i.get("name")
+            if not name or name == "System Idle Process":
+                continue
+            out.append({"name": name,
+                        "cpu": round(i.get("cpu_percent") or 0, 1),
+                        "mem": round(i.get("memory_percent") or 0, 1)})
+    except Exception:
+        pass
+    out.sort(key=lambda x: x["cpu"], reverse=True)
+    return out[:limit]
 
-    if command_name not in ALLOWED_COMMANDS:
-        return {"status": "error", "output": "", "error": f"Command '{command_name}' tidak diizinkan"}
+
+_files_cache = {"t": 0.0, "v": []}
+
+
+def get_largest_files(limit=5):
+    """Hanya dipakai bila LAB_SEND_FILES=1. Di-cache 5 menit, jumlah file dibatasi."""
+    now = time.time()
+    if now - _files_cache["t"] < 300:
+        return _files_cache["v"]
+    home = os.path.expanduser("~")
+    found, scanned = [], 0
+    for sub in ("Desktop", "Documents", "Downloads"):
+        root = os.path.join(home, sub)
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+            dirnames[:] = [d for d in dirnames if not d.startswith((".", "$"))]
+            for fname in filenames:
+                scanned += 1
+                if scanned > 5000:
+                    break
+                fp = os.path.join(dirpath, fname)
+                try:
+                    if os.path.isfile(fp) and not os.path.islink(fp):
+                        size = os.path.getsize(fp)
+                        if size > 1024 * 1024:
+                            found.append((fp, size))
+                except OSError:
+                    continue
+            if scanned > 5000:
+                break
+    found.sort(key=lambda x: x[1], reverse=True)
+    _files_cache["t"] = now
+    _files_cache["v"] = [{"name": os.path.basename(p), "path": p,
+                          "size_mb": round(s / (1024 * 1024), 1)} for p, s in found[:limit]]
+    return _files_cache["v"]
+
+
+# ============================================================
+# Verifikasi perintah (HMAC + timestamp + anti-replay)
+# ============================================================
+_seen = {}  # request_id -> waktu diterima
+_seen_lock = threading.Lock()
+
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def parse_ts(ts):
+    """Terima epoch (detik/ms) atau string ISO-8601. Return epoch detik."""
+    if isinstance(ts, (int, float)) or (isinstance(ts, str) and re.fullmatch(r"\d+(\.\d+)?", ts)):
+        v = float(ts)
+        return v / 1000.0 if v > 1e11 else v
+    dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def verify_command(payload, token=None):
+    """Return (ok, alasan). Replay hanya dicatat setelah signature valid."""
+    token = AGENT_TOKEN if token is None else token
+    req_id = payload.get("request_id")
+    cmd = payload.get("command")
+    ts = payload.get("timestamp")
+    sig = payload.get("signature")
+    params = payload.get("params") or {}
+    if not req_id or not cmd or ts in (None, "") or not sig:
+        return False, "field wajib kurang (request_id/command/timestamp/signature)"
+    ts_str = ts if isinstance(ts, str) else str(ts)
+    message = f"{req_id}|{cmd}|{ts_str}|{canonical(params)}".encode("utf-8")
+    expected = hmac.new(token.encode("utf-8"), message, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected.encode(), str(sig).lower().encode()):
+        return False, "signature tidak valid"
+    try:
+        delta = abs(time.time() - parse_ts(ts))
+    except Exception:
+        return False, "format timestamp tidak valid"
+    if delta > TS_TOLERANCE:
+        return False, f"timestamp kedaluwarsa (selisih {int(delta)} detik; cek jam PC/server)"
+    now = time.time()
+    with _seen_lock:
+        for k in [k for k, t in _seen.items() if now - t > TS_TOLERANCE * 2]:
+            del _seen[k]
+        if req_id in _seen:
+            return False, "request_id sudah dipakai (replay)"
+        _seen[req_id] = now
+    return True, "ok"
+
+
+# ============================================================
+# Eksekusi perintah (whitelist, tanpa shell)
+# ============================================================
+PROCESS_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SHUTDOWN_NOTE = "Perintah dikirim oleh admin lab"
+NEEDS_ROOT = {"shutdown", "restart", "cancel_shutdown"}
+MAX_OUTPUT = 20000
+
+
+def build_command(name, params):
+    """Return (args | None, error | None)."""
+    minutes = max(1, int(math.ceil(SHUTDOWN_DELAY / 60.0)))
+    if name == "taskkill":
+        proc = str((params or {}).get("process_name", ""))
+        if not PROCESS_NAME_RE.match(proc):
+            return None, "process_name tidak valid (huruf/angka . _ - ; maks 64 karakter)"
+        return (["taskkill", "/IM", proc, "/F"] if IS_WINDOWS else ["killall", proc]), None
+    if IS_WINDOWS:
+        table = {
+            "tasklist": ["tasklist"], "ipconfig": ["ipconfig"], "whoami": ["whoami"],
+            "systeminfo": ["systeminfo"],
+            "shutdown": ["shutdown", "/s", "/t", str(SHUTDOWN_DELAY), "/c", SHUTDOWN_NOTE],
+            "restart": ["shutdown", "/r", "/t", str(SHUTDOWN_DELAY), "/c", SHUTDOWN_NOTE],
+            "cancel_shutdown": ["shutdown", "/a"],
+        }
+    else:
+        net = ["ifconfig"] if shutil.which("ifconfig") else ["ip", "addr"]
+        table = {
+            "tasklist": ["ps", "aux"], "ipconfig": net, "whoami": ["whoami"],
+            "systeminfo": ["uname", "-a"],
+            "shutdown": ["shutdown", "-h", f"+{minutes}", SHUTDOWN_NOTE],
+            "restart": ["shutdown", "-r", f"+{minutes}", SHUTDOWN_NOTE],
+            "cancel_shutdown": ["shutdown", "-c"],
+        }
+    if name not in table:
+        return None, f"Command '{name}' tidak diizinkan"
+    return table[name], None
+
+
+def execute_command(name, params=None):
+    start = time.time()
+
+    def result(status, output="", error="", **extra):
+        d = {"status": status, "output": output[:MAX_OUTPUT], "error": error,
+             "execution_time": round(time.time() - start, 2)}
+        d.update(extra)
+        return d
+
+    args, err = build_command(name, params)
+    if err:
+        return result("error", error=err)
+
+    if not IS_WINDOWS and name in NEEDS_ROOT and not IS_ROOT:
+        if shutil.which("sudo"):
+            args = ["sudo", "-n"] + args
+        else:
+            return result("error", error="Perintah ini butuh root. Jalankan agent sebagai root/service.")
 
     try:
-        if command_name == 'taskkill':
-            process_name = (params or {}).get('process_name', '')
-            if not process_name:
-                return {"status": "error", "output": "", "error": "Nama proses tidak diberikan"}
-            cmd = f"taskkill /IM {process_name} /F" if platform.system() == "Windows" else f"killall {process_name}"
-        elif command_name == 'shutdown':
-            show_hacker_effect(command_name)
-            cmd = "shutdown /s /t 30" if platform.system() == "Windows" else "shutdown -h +1"
-        elif command_name == 'restart':
-            show_hacker_effect(command_name)
-            cmd = "shutdown /r /t 30" if platform.system() == "Windows" else "shutdown -r +1"
-        elif command_name == 'cancel_shutdown':
-            cmd = "shutdown /a" if platform.system() == "Windows" else "shutdown -c"
-            print(f"[!] Perintah CANCEL SHUTDOWN diterima!")
-        else:
-            cmd = ALLOWED_COMMANDS[command_name]
-
-        startupinfo = None
-        if platform.system() == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-        proc_result = subprocess.run(
-            cmd if isinstance(cmd, str) else cmd,
-            capture_output=True, timeout=COMMAND_TIMEOUT,
-            startupinfo=startupinfo, shell=True
-        )
-
-        # Decode with proper encoding
-        def decode_output(data):
-            for enc in ['utf-8', 'cp1252', 'latin-1']:
-                try:
-                    return data.decode(enc, errors='replace')
-                except:
-                    continue
-            return data.decode('utf-8', errors='replace')
-
-        stdout = decode_output(proc_result.stdout)
-        stderr = decode_output(proc_result.stderr)
-
-        elapsed = time.time() - start_time
-        output = (stdout or "") + (stderr or "")
-        output = output.strip()
-
-        if proc_result.returncode == 0 and output:
-            return {"status": "success", "output": output, "error": "", "execution_time": round(elapsed, 2)}
-        elif proc_result.returncode == 0 and not output:
-            return {"status": "success", "output": "Command executed successfully (no output)",
-                    "error": "", "execution_time": round(elapsed, 2)}
-        else:
-            return {"status": "error", "output": output, "error": f"Return code: {proc_result.returncode}",
-                    "execution_time": round(elapsed, 2)}
-
+        r = run(args, COMMAND_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return {"status": "error", "output": "", "error": f"Command timeout ({COMMAND_TIMEOUT}s)",
-                "execution_time": COMMAND_TIMEOUT}
+        return result("error", error=f"Command timeout ({COMMAND_TIMEOUT}s)")
     except Exception as e:
-        return {"status": "error", "output": "", "error": str(e),
-                "execution_time": round(time.time() - start_time, 2)}
+        return result("error", error=str(e))
+
+    out = (decode(r.stdout) + decode(r.stderr)).strip()
+    if r.returncode == 0:
+        return result("success", out or "Command executed successfully (no output)")
+    hint = ""
+    if not IS_WINDOWS and name in NEEDS_ROOT and not IS_ROOT:
+        hint = " (butuh root atau sudo tanpa password)"
+    return result("error", out, f"Return code: {r.returncode}{hint}")
 
 
-import threading  # Pastikan library ini di-import di bagian paling atas agent.py
+# ============================================================
+# MQTT
+# ============================================================
+CLIENT_ID = f"agent_{HOSTNAME}_{random.randint(1000, 9999)}"
+_cmd_lock = threading.Lock()
+
+
+def make_client():
+    try:
+        from paho.mqtt.enums import CallbackAPIVersion
+        return mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2,
+                           client_id=CLIENT_ID, transport="websockets")
+    except (ImportError, AttributeError, TypeError):
+        return mqtt.Client(client_id=CLIENT_ID, transport="websockets")
+
+
+def publish_result(client, req_id, cmd, res):
+    msg = {"request_id": req_id, "hostname": HOSTNAME, "command": cmd, "result": res}
+    try:
+        client.publish(RESULT_TOPIC, json.dumps(msg), qos=1)
+    except Exception as e:
+        log(f"[x] Gagal kirim hasil: {e}")
+
+
+def handle_command(client, payload):
+    req_id = str(payload.get("request_id", ""))
+    cmd = str(payload.get("command", ""))
+    ok, reason = verify_command(payload)
+    if not ok:
+        log(f"[x] Perintah '{cmd}' ({req_id}) ditolak: {reason}")
+        publish_result(client, req_id, cmd, {
+            "status": "error", "output": "", "error": f"Ditolak: {reason}",
+            "execution_time": 0})
+        return
+    log(f"[>] Menjalankan '{cmd}' ({req_id})")
+    with _cmd_lock:
+        res = execute_command(cmd, payload.get("params") or {})
+    # Status dikirim SETELAH perintah OS benar-benar dijalankan (bukan sukses palsu)
+    publish_result(client, req_id, cmd, res)
+    log(f"[{'v' if res['status'] == 'success' else 'x'}] '{cmd}' selesai: {res['status']}")
+
+
+def on_connect(client, userdata, flags, rc, *extra):
+    failed = rc.is_failure if hasattr(rc, "is_failure") else (rc != 0)
+    if failed:
+        log(f"[x] Gagal konek ke broker (rc={rc}). Mencoba lagi otomatis...")
+        return
+    log(f"[v] Terhubung ke broker {BROKER_URL}:{PORT}")
+    client.subscribe(COMMAND_TOPIC, qos=1)
+    log(f"[*] Subscribe: {COMMAND_TOPIC}")
+
+
+def on_disconnect(client, userdata, *args):
+    log("[!] Koneksi MQTT terputus. paho akan menyambung ulang otomatis.")
+
 
 def on_message(client, userdata, msg):
-    """Handle incoming MQTT messages (for remote commands)"""
+    if msg.topic != COMMAND_TOPIC:
+        return
     try:
-        payload_str = msg.payload.decode('utf-8')
-        payload = json.loads(payload_str)
-
-        command = payload.get('command', '')
-        request_id = payload.get('request_id', '')
-        params = payload.get('params', {})
-        timestamp = payload.get('timestamp', '')
-
-        print(f"\n[📨] Command diterima: {command} (ID: {request_id})")
-        if params:
-            print(f"     Params: {params}")
-
-        # 2. PENANGANAN ASINKRONUS UNTUK SHUTDOWN / RESTART
-        # Jika perintah mematikan sistem, kirim status sukses DULU ke server baru matikan PC
-        if command in ["shutdown", "restart"]:
-            result_topic = f"lab/command/result/{HOSTNAME}"
-            result_payload = {
-                "request_id": request_id,
-                "hostname": HOSTNAME,
-                "command": command,
-                "result": {
-                    "status": "success",
-                    "output": f"Perintah {command} berhasil diterima, sistem akan segera mengeksekusi.",
-                    "error": None,
-                    "execution_time": 0.1
-                }
-            }
-            # Kirim laporan ke server dulu agar di dashboard statusnya berubah jadi 'Success'
-            client.publish(result_topic, json.dumps(result_payload))
-            print(f"[✓] Status sukses awal '{command}' dikirim ke server. Memulai proses pembersihan...")
-
-            # Jalankan efek hacker dan shutdown di background thread agar tidak membekukan MQTT
-            def run_delayed_command():
-                execute_command(command, params)
-
-            threading.Thread(target=run_delayed_command, daemon=True).start()
-
-        else:
-            # Perintah biasa (bukan shutdown/restart) bisa langsung dieksekusi secara sinkronus
-            result = execute_command(command, params)
-
-            result_topic = f"lab/command/result/{HOSTNAME}"
-            result_payload = {
-                "request_id": request_id,
-                "hostname": HOSTNAME,
-                "command": command,
-                "result": result
-            }
-
-            client.publish(result_topic, json.dumps(result_payload))
-            status_icon = "✓" if result["status"] == "success" else "✗"
-            print(f"[{status_icon}] Hasil command '{command}' dikirim ke {result_topic}")
-            if result.get("execution_time"):
-                print(f"     Waktu eksekusi: {result['execution_time']}s")
-
-    except json.JSONDecodeError as e:
-        print(f"[✗] Gagal parse JSON: {e}")
+        payload = json.loads(msg.payload.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("payload bukan objek")
     except Exception as e:
-        print(f"[✗] Error processing remote command: {e}")
+        log(f"[x] JSON perintah tidak valid: {e}")
+        return
+    threading.Thread(target=handle_command, args=(client, payload), daemon=True).start()
 
 
-def on_connect(*args, **kwargs):
-    """Callback saat berhasil/gagal terhubung ke MQTT Broker"""
-    global mqtt_connected
-    
-    # Ambil nilai 'rc' (Return Code) secara dinamis berdasarkan jumlah argumen
-    # v1.x menggunakan args[3], v2.x menggunakan args[3] sebagai flags dan args[4] sebagai reason code/rc
-    if len(args) >= 4:
-        rc = args[3] if isinstance(args[3], int) else getattr(args[3], 'value', args[3])
-        if len(args) >= 5 and isinstance(args[4], int):
-            rc = args[4]
-    else:
-        rc = args[2] if len(args) > 2 else 99
-
-    if rc == 0:
-        print("[✓] Terhubung dengan sukses ke Cloudflare MQTT Broker")
-        mqtt_connected = True
-        # Subscribe ke command topic untuk remote control
-        # args[0] adalah objek 'client'
-        args[0].subscribe(f"lab/command/{HOSTNAME}")
-        print(f"[*] Subscribed ke topik remote: lab/command/{HOSTNAME}")
-    else:
-        print(f"[✗] Gagal terhubung ke MQTT Broker, Kode Hasil (rc): {rc}")
-        mqtt_connected = False
-
-def on_disconnect(*args, **kwargs):
-    """Callback saat koneksi MQTT terputus"""
-    global mqtt_connected
-    mqtt_connected = False
-    
-    # Ambil nilai rc secara aman dari argumen terakhir atau keyword arguments
-    rc = kwargs.get('rc', None)
-    if rc is None and len(args) > 0:
-        # Biasanya rc ada di indeks ke-2 (v1) atau indeks ke-3/4 (v2)
-        for arg in reversed(args):
-            if isinstance(arg, int):
-                rc = arg
-                break
-            elif hasattr(arg, 'value') and isinstance(arg.value, int):
-                rc = arg.value
-                break
-                
-    print(f"[⚠️] Koneksi MQTT Terputus! Kode Status (rc): {rc}. Mencoba menghubungkan kembali...")
+# ============================================================
+# Payload monitoring (format sama dengan versi lama)
+# ============================================================
+_state = {"rx": 0, "t": time.time(), "lat": 999, "lat_t": 0.0}
 
 
-# ==================== INITIALIZATION MQTT CLIENT (UNIVERSAL v1 & v2) ====================
-import random
+def build_payload():
+    now = time.time()
+    rx, _tx = get_net_usage()
+    elapsed = max(0.001, now - _state["t"])
+    down_mbps = round(max(0, (rx - _state["rx"]) * 8 / (1024 * 1024) / elapsed), 2)
+    _state["rx"], _state["t"] = rx, now
 
-# 1. Buat Client ID unik berdasarkan nama laptop + angka acak agar tidak saling tendang
-CLIENT_ID = f"agent_{HOSTNAME}_{random.randint(1000, 9999)}"
+    if now - _state["lat_t"] > 10:
+        _state["lat"], _state["lat_t"] = get_latency(PING_TARGET), now
 
-try:
-    from paho.mqtt.enums import CallbackAPIVersion
-    # Konfigurasi untuk paho-mqtt v2.x (Menggunakan WebSockets)
-    client = mqtt.Client(callback_api_version=CallbackAPIVersion.VERSION2, client_id=CLIENT_ID, transport="websockets")
-except (ImportError, AttributeError):
-    # Fallback untuk paho-mqtt v1.x (Menggunakan WebSockets)
-    client = mqtt.Client(client_id=CLIENT_ID, transport="websockets")
-
-# 2. Hubungkan fungsi callback universal yang sudah diperbaiki sebelumnya
-client.on_connect = on_connect
-client.on_disconnect = on_disconnect
-client.on_message = on_message
-
-# 3. Set Last Will and Testament (Status Offline jika agen mati tiba-tiba)
-client.will_set(TOPIC, json.dumps({"id": HOSTNAME, "status": "offline"}), retain=True)
-
-# 4. WAJIB: Aktifkan SSL/TLS agar bisa melewati enkripsi HTTPS port 443 Cloudflare
-client.tls_set()
-
-# 5. WAJIB: Atur jalur sub-folder WebSocket ke '/mqtt' agar dikenali oleh Mosquitto Server
-client.ws_set_options(path="/mqtt")
-
-mqtt_connected = False
-# =========================================================================================
-try:
-    print(f"[*] Menghubungkan ke broker MQTT {BROKER_URL}:{PORT}...")
-    client.connect(BROKER_URL, PORT, 60)
-    client.loop_start()
-    mqtt_connected = True
-except socket.gaierror as e:
-    print(f"[✗] Kesalahan DNS/Jaringan: Tidak bisa resolve {BROKER_URL} - {e}")
-except ConnectionRefusedError as e:
-    print(f"[✗] Koneksi Ditolak: Broker {BROKER_URL}:{PORT} tidak menerima koneksi - {e}")
-except TimeoutError as e:
-    print(f"[✗] Koneksi Timeout: Broker {BROKER_URL}:{PORT} tidak merespons - {e}")
-except Exception as e:
-    print(f"[✗] Kesalahan MQTT: {type(e).__name__}: {e}")
-
-old_rx, old_tx = get_net_usage(INTERFACE_NAME)
-last_time = time.time()
-IP_ADDRESS, MAC_ADDRESS = get_interface_ip_mac(INTERFACE_NAME)
-
-while True:
+    mem = psutil.virtual_memory()
     try:
-        current_time = time.time()
-        elapsed = current_time - last_time
-        last_time = current_time
-
-        current_rx_bytes, current_tx_bytes = get_net_usage(INTERFACE_NAME)
-        down_mbps = ((current_rx_bytes - old_rx) * 8 / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-        old_rx, old_tx = current_rx_bytes, current_tx_bytes
-
-        mem = psutil.virtual_memory()
-        
-        # Dapatkan semua partisi/drive dan akumulasi total storage
-        disk_partitions = psutil.disk_partitions()
-        total_disk_space = 0
-        total_disk_used = 0
-        total_disk_free = 0
-        disk_details = []
-        
-        for partition in disk_partitions:
-            # Skip drive CD-ROM, RAM disk, dll
-            if 'cdrom' in partition.opts or partition.fstype == '':
-                continue
-            try:
-                usage = psutil.disk_usage(partition.mountpoint)
-                total_disk_space += usage.total
-                total_disk_used += usage.used
-                total_disk_free += usage.free
-                disk_details.append({
-                    "mount": partition.mountpoint,
-                    "device": partition.device,
-                    "fstype": partition.fstype,
-                    "total_gb": round(usage.total / (1024**3), 1),
-                    "used_gb": round(usage.used / (1024**3), 1),
-                    "free_gb": round(usage.free / (1024**3), 1),
-                    "percent": round(usage.percent, 1)
-                })
-            except (PermissionError, OSError):
-                continue
-        
-        disk_percent = round((total_disk_used / total_disk_space) * 100, 1) if total_disk_space > 0 else 0
-
         freq = psutil.cpu_freq()
-        current_ghz = round(freq.current / 1000, 2) if freq else 0
-        max_ghz = round(freq.max / 1000, 2) if freq else 0
+    except Exception:
+        freq = None
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "unknown"
 
-        gpu_info = get_gpu_info()
-
-        payload = {
-            "id": HOSTNAME, "status": "online", "user": getpass.getuser(),
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "info": {
-                "uptime": get_uptime(),
-                "os": f"{platform.system()} {platform.release()}",
-                "cpu_name": CPU_NAME
-            },
-            "network": {
-                "down_mbps": round(max(0, down_mbps), 2),
-                "traffic_in_gb": round(current_rx_bytes / (1024**3), 2),
-                "latency_ms": get_latency(PING_TARGET),
-                "iface": INTERFACE_NAME,
-                "ip": IP_ADDRESS,
-                "mac": MAC_ADDRESS
-            },
-            "metrics": {
-                "cpu": {
-                    "percent": int(psutil.cpu_percent()),
-                    "threads": CPU_THREADS,
+    payload = {
+        "id": HOSTNAME, "status": "online", "user": user,
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "info": {"uptime": get_uptime(), "os": f"{OS_NAME} {platform.release()}",
+                 "cpu_name": CPU_NAME},
+        "network": {"down_mbps": down_mbps,
+                    "traffic_in_gb": round(rx / (1024 ** 3), 2),
+                    "latency_ms": _state["lat"], "iface": INTERFACE_NAME,
+                    "ip": IP_ADDRESS, "mac": MAC_ADDRESS},
+        "metrics": {
+            "cpu": {"percent": int(psutil.cpu_percent()), "threads": CPU_THREADS,
                     "cores": CPU_CORES,
-                    "ghz": current_ghz,
-                    "max_ghz": max_ghz
-                },
-                "ram_percent": int(mem.percent),
-                "ram": {
-                    "used_gb": round(mem.used / (1024**3), 2),
-                    "total_gb": round(mem.total / (1024**3), 1)
-                },
-                "storage": {
-                    "total_gb": round(total_disk_space / (1024**3), 1),
-                    "used_gb": round(total_disk_used / (1024**3), 1),
-                    "free_gb": round(total_disk_free / (1024**3), 1),
-                    "percent": disk_percent,
-                    "drives": disk_details
-                },
-                "gpu": gpu_info,
-                "top_processes": get_top_processes(5),
-                "top_files": get_largest_files(5)
-            }
-        }
-        if mqtt_connected or client.is_connected():
-            client.publish(TOPIC, json.dumps(payload), retain=True)
-        else:
-            print(f"[!] MQTT tidak terhubung, skip publish")
-        print(f"[{payload['time']}] CPU: {payload['metrics']['cpu']['percent']}% ({CPU_THREADS} Thread)")
-    except Exception as e:
-        print(f"Err: {e}")
-    time.sleep(2)
+                    "ghz": round(freq.current / 1000, 2) if freq and freq.current else 0,
+                    "max_ghz": round(freq.max / 1000, 2) if freq and freq.max else 0},
+            "ram_percent": int(mem.percent),
+            "ram": {"used_gb": round(mem.used / (1024 ** 3), 2),
+                    "total_gb": round(mem.total / (1024 ** 3), 1)},
+            "storage": get_disk_info(),
+            "gpu": get_gpu_info(),
+            "top_processes": get_top_processes(5),
+        },
+    }
+    if SEND_FILES:
+        payload["metrics"]["top_files"] = get_largest_files(5)
+    return payload
+
+
+def main():
+    log(f"Lab Agent mulai | OS={OS_NAME} | host={HOSTNAME} | broker={BROKER_URL}:{PORT}")
+    log(f"CPU: {CPU_NAME} | iface: {INTERFACE_NAME} ({IP_ADDRESS})")
+    if not IS_WINDOWS and not IS_ROOT:
+        log("[i] Bukan root: shutdown/restart memakai 'sudo -n' (perlu sudoers NOPASSWD) atau jalankan sebagai root.")
+    prime_processes()
+
+    client = make_client()
+    if MQTT_USER:
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+    client.will_set(TOPIC, json.dumps({"id": HOSTNAME, "status": "offline"}),
+                    qos=1, retain=True)
+    if USE_TLS:
+        client.tls_set()
+    client.ws_set_options(path=WS_PATH)
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    client.reconnect_delay_set(min_delay=1, max_delay=60)
+    client.connect_async(BROKER_URL, PORT, keepalive=60)
+    client.loop_start()
+
+    try:
+        while True:
+            try:
+                payload = build_payload()
+                if client.is_connected():
+                    client.publish(TOPIC, json.dumps(payload), qos=0, retain=True)
+                    m = payload["metrics"]
+                    log(f"CPU {m['cpu']['percent']}% | RAM {m['ram_percent']}% | "
+                        f"Disk {m['storage']['percent']}%")
+                else:
+                    log("[!] MQTT belum terhubung, publish dilewati")
+            except Exception as e:
+                log(f"[!] Error loop: {e}")
+            time.sleep(INTERVAL)
+    except KeyboardInterrupt:
+        log("Dihentikan. Mengirim status offline...")
+        try:
+            client.publish(TOPIC, json.dumps({"id": HOSTNAME, "status": "offline"}),
+                           qos=1, retain=True).wait_for_publish(2)
+        except Exception:
+            pass
+        client.loop_stop()
+        client.disconnect()
+
+
+if __name__ == "__main__":
+    main()
